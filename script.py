@@ -276,8 +276,15 @@ async def scrape_business_info(page, url, writer, csvfile, unique_businesses):
 
 async def get_business_links_from_page(page):
   """Get business links from current page without scrolling through multiple pages"""
-  # Wait for initial load
-  await page.wait_for_selector('a.provider__cta-link.website-link__item', timeout=30000)
+  # Try to wait for the selector, but don't fail if it times out
+  try:
+    await page.wait_for_selector('a.provider__cta-link.website-link__item', timeout=10000)
+  except:
+    # If selector timeout, try to get whatever links are available
+    pass
+
+  # Give the page a moment to load
+  await page.wait_for_timeout(3000)
 
   # Simple scroll to load all businesses on current page
   prev_count = 0
@@ -423,7 +430,7 @@ async def main():
           try:
             # Navigate to the page
             await page.goto(page_url, wait_until='networkidle', timeout=60000)
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(3000)
 
             # Initial human behavior
             await simulate_human_behavior(page)
@@ -432,7 +439,7 @@ async def main():
             links = await get_business_links_from_page(page)
 
             # If no businesses found, we've reached the end
-            if not links:
+            if not links or len(links) == 0:
               logging.info(
                 f"❌ No businesses found on page {current_page}. Pagination complete.")
               break
@@ -448,6 +455,35 @@ async def main():
             logging.info(
               f"✅ Completed page {current_page}. Entries from this page: {page_entries}")
 
+            # Check if we should continue to next page
+            # If we found very few businesses (less than 10), might be the last page
+            if len(links) < 10:
+              logging.info(
+                f"⚠️  Found only {len(links)} businesses on page {current_page}. This might be the last page.")
+              # Try one more page to confirm
+              next_page_test = current_page + 1
+              next_page_url = f"{base_url}?page={next_page_test}"
+
+              try:
+                await page.goto(next_page_url, wait_until='networkidle', timeout=30000)
+                await page.wait_for_timeout(2000)
+                test_links = await page.query_selector_all('a.provider__cta-link.website-link__item')
+
+                if not test_links or len(test_links) == 0:
+                  logging.info(
+                    f"✅ Confirmed: No businesses on page {next_page_test}. Pagination complete.")
+                  break
+                else:
+                  logging.info(
+                    f"🔄 Found {len(test_links)} businesses on page {next_page_test}. Continuing...")
+                  # Go back to process this page normally
+                  current_page = next_page_test
+                  continue
+              except:
+                logging.info(
+                  f"❌ Could not access page {next_page_test}. Assuming pagination complete.")
+                break
+
             # Move to next page
             current_page += 1
 
@@ -456,8 +492,18 @@ async def main():
 
           except Exception as e:
             logging.error(f"❌ Error processing page {current_page}: {e}")
-            # If we get an error, it might mean we've reached the end of pages
-            break
+
+            # Try to continue to next page in case this was just a temporary issue
+            if current_page <= 3:  # Only try to skip for first few pages
+              logging.info(
+                f"⚠️  Attempting to continue to page {current_page + 1}...")
+              current_page += 1
+              await asyncio.sleep(5)  # Longer delay after error
+              continue
+            else:
+              # If we're on later pages and get an error, probably reached the end
+              logging.info(f"❌ Multiple errors or reached end of pagination.")
+              break
 
       # Final summary
       logging.info(f"\n" + "=" * 60)
