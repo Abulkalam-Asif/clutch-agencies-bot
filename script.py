@@ -6,7 +6,7 @@ import json
 import logging
 import random
 from datetime import datetime
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, urlunparse
 from playwright.async_api import async_playwright
 
 
@@ -60,10 +60,23 @@ def is_valid_email(email):
     return False
 
   # Skip common invalid patterns
-  invalid_patterns = ['noreply', 'no-reply', 'example', 'test', '.png', '.jpg']
+  invalid_patterns = [
+    'noreply', 'no-reply', 'example', 'test', '.png', '.jpg',
+    'sentry', # Filter out sentry system emails
+    'notifications@', 'alert@', 'system@', # Common system email prefixes
+    'donotreply', 'do-not-reply',
+    'postmaster@', 'mailer-daemon@',
+    'wordpress@', 'wp@', # Common CMS system emails
+    'webmaster@', 'administrator@', 'admin@',
+  ]
   email_lower = email.lower()
 
   if any(pattern in email_lower for pattern in invalid_patterns):
+    return False
+
+  # Check for hexadecimal or UUID-like patterns in the local part (before @)
+  local_part = email.split('@')[0]
+  if len(local_part) >= 32 or (len(local_part) >= 8 and all(c in '0123456789abcdef' for c in local_part.lower())):
     return False
 
   # Basic email format check
@@ -72,64 +85,90 @@ def is_valid_email(email):
 
 
 def is_valid_phone(phone):
-  """Basic phone validation"""
-  if not phone or len(phone) < 10:
+  """Enhanced phone validation"""
+  if not phone:
     return False
 
-  # Remove invalid patterns
-  invalid_patterns = [r'^0+$', r'^1+$', r'^1234567890$', r'^(\d)\1{9,}$']
-
-  for pattern in invalid_patterns:
-    if re.match(pattern, phone):
+  # Remove any remaining non-digit characters except +
+  clean_phone = re.sub(r'[^\d+]', '', phone)
+  
+  # Handle international numbers with country code
+  if clean_phone.startswith('+'):
+    # Remove the + for length checks
+    digits_only = clean_phone[1:]
+    # International numbers should be 10-15 digits
+    if len(digits_only) < 10 or len(digits_only) > 15:
+      return False
+  else:
+    digits_only = clean_phone
+    # Domestic numbers should be 10-11 digits
+    if len(digits_only) < 10 or len(digits_only) > 11:
       return False
 
-  # Check for reasonable phone format
-  if len(phone) == 10:
-    area_code = phone[:3]
-    if area_code[0] in ['0', '1'] or area_code[1:] in ['00', '11']:
+  # Remove invalid patterns
+  invalid_patterns = [
+    r'^0+$',           # All zeros
+    r'^1+$',           # All ones  
+    r'^1234567890$',   # Sequential numbers
+    r'^(\d)\1{9,}$',   # Repeated digit
+    r'^12345678901$',  # Sequential with 1 prefix
+  ]
+
+  for pattern in invalid_patterns:
+    if re.match(pattern, digits_only):
+      return False
+
+  # For US numbers (10 digits or 11 with 1 prefix)
+  if len(digits_only) == 10:
+    area_code = digits_only[:3]
+    # Area code can't start with 0 or 1
+    if area_code[0] in ['0', '1']:
+      return False
+    # Area code can't be all same digit or sequential
+    if area_code[1:] in ['00', '11'] or area_code == '123':
+      return False
+      
+  elif len(digits_only) == 11 and digits_only.startswith('1'):
+    # US number with country code 1
+    area_code = digits_only[1:4]
+    if area_code[0] in ['0', '1']:
+      return False
+    if area_code[1:] in ['00', '11'] or area_code == '123':
       return False
 
   return True
 
 
-async def extract_business_name(page):
-  """Extract business name using multiple strategies"""
-  # Try title tag first
+def extract_business_name_from_url(url):
+  """Extract business name from URL as required by client
+  e.g. https://Syndr.ai -> Syndr
+  """
   try:
-    title = await page.title()
-    if title and len(title.strip()) < 100:
-      # Clean up title
-      title_clean = re.sub(
-        r'(\s*[-|]\s*(Home|Homepage|Welcome).*)', '', title, flags=re.IGNORECASE)
-      return title_clean.strip()
-  except:
-    pass
-
-  # Try h1 tag
-  try:
-    h1 = await page.query_selector('h1')
-    if h1:
-      h1_text = await h1.text_content()
-      if h1_text and len(h1_text.strip()) < 100:
-        return h1_text.strip()
-  except:
-    pass
-
-  # Try meta og:site_name
-  try:
-    og_title = await page.query_selector('meta[property="og:site_name"]')
-    if og_title:
-      content = await og_title.get_attribute('content')
-      if content:
-        return content.strip()
-  except:
-    pass
-
-  return ""
+    if not url:
+      return ""
+      
+    # Parse URL and get domain
+    parsed = urlparse(url)
+    domain = parsed.netloc or parsed.path  # Use netloc if available, otherwise path
+    
+    # Remove www. if present
+    if domain.startswith('www.'):
+      domain = domain[4:]
+    
+    # Extract base domain without extension (.com, .ai, etc.)
+    parts = domain.split('.')
+    if len(parts) >= 1:
+      base_name = parts[0]
+      return base_name
+    
+    return domain
+  except Exception as e:
+    logging.error(f"Error extracting business name from URL {url}: {e}")
+    return url
 
 
 async def extract_emails(page):
-  """Extract emails from page"""
+  """Extract emails from page and return only the first one"""
   emails = set()
 
   # Get page content
@@ -141,21 +180,29 @@ async def extract_emails(page):
     for link in mailto_links:
       href = await link.get_attribute('href')
       if href:
-        email = href.replace('mailto:', '').split('?')[0]
+        # Clean the email address from mailto: and any URL parameters
+        email = href.replace('mailto:', '').split('?')[0].strip()
+        # Clean any URL encoding (like %20)
+        email = email.replace('%20', '')
         if is_valid_email(email):
           emails.add(email)
+          return list(emails)[:1]  # Return just the first email from mailto links
 
     # Search in content
     email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,7}\b'
     found_emails = re.findall(email_pattern, content)
     for email in found_emails:
+      # Clean any URL encoding (like %20)
+      email = email.replace('%20', '').strip()
       if is_valid_email(email):
         emails.add(email)
+        if len(emails) >= 1:  # Stop once we have 1 email
+          break
 
   except Exception as e:
     logging.error(f"Error extracting emails: {e}")
 
-  return list(emails)
+  return list(emails)[:1]  # Return only the first email
 
 
 async def extract_phones(page):
@@ -163,38 +210,101 @@ async def extract_phones(page):
   phones = set()
 
   try:
-    # Look for tel: links first
+    # Look for tel: links first (highest priority)
     tel_links = await page.query_selector_all('a[href^="tel:"]')
     for link in tel_links:
       href = await link.get_attribute('href')
       if href:
-        phone = re.sub(r'[^\d+]', '', href.replace('tel:', ''))
-        if is_valid_phone(phone):
-          phones.add(phone)
+        # Extract phone from tel: link more carefully
+        tel_phone = href.replace('tel:', '').strip()
+        # Remove common separators but keep + for international numbers
+        cleaned_tel = re.sub(r'[^\d+]', '', tel_phone)
+        if is_valid_phone(cleaned_tel):
+          phones.add(cleaned_tel)
+          return list(phones)[:1]  # Return immediately if found in tel: link
 
-    # Search in page content
+    # If no tel: links found, search in page content with better patterns
     content = await page.content()
+    
+    # Enhanced phone patterns to catch more formats
     phone_patterns = [
-        r'\+?1?[-.\s]?\(?([0-9]{3})\)?[-.\s]?([0-9]{3})[-.\s]?([0-9]{4})',
-        r'(\d{3})[-.\s]?(\d{3})[-.\s]?(\d{4})',
+        # International format with country code
+        r'\+\d{1,3}[-.\s]?\(?(\d{3})\)?[-.\s]?(\d{3})[-.\s]?(\d{4})',
+        # US format with parentheses (555) 123-4567
+        r'\((\d{3})\)[-.\s]?(\d{3})[-.\s]?(\d{4})',
+        # US format with dashes 555-123-4567
+        r'(\d{3})[-.\s](\d{3})[-.\s](\d{4})',
+        # US format with dots 555.123.4567
+        r'(\d{3})\.(\d{3})\.(\d{4})',
+        # Compact format 5551234567
+        r'(\d{3})(\d{3})(\d{4})',
+        # International formats
+        r'\+(\d{1,3})[-.\s]?(\d{1,4})[-.\s]?(\d{1,4})[-.\s]?(\d{1,9})',
+        # Format with +1 country code
+        r'\+1[-.\s]?\(?(\d{3})\)?[-.\s]?(\d{3})[-.\s]?(\d{4})',
     ]
 
     for pattern in phone_patterns:
       matches = re.findall(pattern, content)
       for match in matches:
         if isinstance(match, tuple):
+          # Join all groups and clean
           phone = ''.join(match)
         else:
           phone = match
+        
+        # Clean the phone number
         phone = re.sub(r'[^\d+]', '', phone)
+        
+        # Add +1 if it's a 10-digit US number without country code
+        if len(phone) == 10 and phone[0] not in ['0', '1']:
+          phone = '+1' + phone
+        
         if is_valid_phone(phone):
           phones.add(phone)
-          break  # Only get the first valid phone
+          return list(phones)[:1]  # Return the first valid phone found
+
+    # Fallback: look for any sequence of digits that might be a phone
+    fallback_pattern = r'\b(\d{10,15})\b'
+    fallback_matches = re.findall(fallback_pattern, content)
+    for phone in fallback_matches:
+      if is_valid_phone(phone):
+        # Add +1 if it's a 10-digit US number
+        if len(phone) == 10 and phone[0] not in ['0', '1']:
+          phone = '+1' + phone
+        phones.add(phone)
+        return list(phones)[:1]
 
   except Exception as e:
     logging.error(f"Error extracting phones: {e}")
 
   return list(phones)[:1]  # Return max 1 phone
+
+
+def clean_url(url):
+  """Clean URL by removing UTM parameters and other tracking parameters"""
+  if not url:
+    return url
+
+  try:
+    # Parse the URL
+    parsed = urlparse(url)
+
+    # Remove query parameters (everything after ?)
+    clean_parsed = parsed._replace(query='', fragment='')
+
+    # Reconstruct the clean URL
+    clean_url = urlunparse(clean_parsed)
+
+    # Remove trailing slash if present
+    if clean_url.endswith('/'):
+      clean_url = clean_url[:-1]
+
+    return clean_url
+
+  except Exception as e:
+    logging.error(f"Error cleaning URL {url}: {e}")
+    return url
 
 
 async def scrape_business_info(page, url, writer, csvfile, unique_businesses):
@@ -203,8 +313,8 @@ async def scrape_business_info(page, url, writer, csvfile, unique_businesses):
     # Clean the URL to remove UTM parameters
     clean_website_url = clean_url(url)
 
-    # Extract business name
-    business_name = await extract_business_name(page)
+    # Extract business name from URL instead of page content
+    business_name = extract_business_name_from_url(clean_website_url)
     if not business_name.strip():
       return 0
 
@@ -214,60 +324,32 @@ async def scrape_business_info(page, url, writer, csvfile, unique_businesses):
     unique_businesses.add(business_name)
 
     # Extract contact info
-    emails = await extract_emails(page)
-    phones = await extract_phones(page)
+    emails = await extract_emails(page)  # Now returns max 1 email
+    phones = await extract_phones(page)  # Already returns max 1 phone
 
-    # Write to CSV
-    if not emails and not phones:
-      # Write entry with no contact info
-      writer.writerow({
-          'website_url': clean_website_url,
-          'business_name': business_name,
-          'email': '',
-          'phone': ''
-      })
-      csvfile.flush()  # Immediately flush to file
+    # Prepare data for CSV
+    email = emails[0] if emails else ""
+    phone = phones[0] if phones else ""
+    
+    # Write to CSV - one row per website with at most one email and one phone
+    writer.writerow({
+        'website_url': clean_website_url,
+        'business_name': business_name,
+        'email': email,
+        'phone': phone
+    })
+    csvfile.flush()  # Immediately flush to file
+    
+    if email and phone:
+      logging.info(f"💾 Saved: {business_name} | {email} | {phone}")
+    elif email:
+      logging.info(f"💾 Saved: {business_name} | {email}")
+    elif phone:
+      logging.info(f"💾 Saved: {business_name} | {phone}")
+    else:
       logging.info(f"💾 Saved: {business_name} (no contact info)")
-      return 1
-
-    entries_written = 0
-    # Create entries for each email/phone combination
-    if emails and phones:
-      for email in emails:
-        for phone in phones:
-          writer.writerow({
-              'website_url': clean_website_url,
-              'business_name': business_name,
-              'email': email,
-              'phone': phone
-          })
-          csvfile.flush()  # Immediately flush to file
-          entries_written += 1
-          logging.info(f"💾 Saved: {business_name} | {email} | {phone}")
-    elif emails:
-      for email in emails:
-        writer.writerow({
-            'website_url': clean_website_url,
-            'business_name': business_name,
-            'email': email,
-            'phone': ''
-        })
-        csvfile.flush()  # Immediately flush to file
-        entries_written += 1
-        logging.info(f"💾 Saved: {business_name} | {email}")
-    elif phones:
-      for phone in phones:
-        writer.writerow({
-            'website_url': clean_website_url,
-            'business_name': business_name,
-            'email': '',
-            'phone': phone
-        })
-        csvfile.flush()  # Immediately flush to file
-        entries_written += 1
-        logging.info(f"💾 Saved: {business_name} | {phone}")
-
-    return entries_written
+    
+    return 1  # Always return 1 since we only create one entry per website
 
   except Exception as e:
     logging.error(f"Error scraping {url}: {e}")
@@ -278,9 +360,10 @@ async def get_business_links_from_page(page):
   """Get business links from current page without scrolling through multiple pages"""
   # Try to wait for the selector, but don't fail if it times out
   try:
-    await page.wait_for_selector('a.provider__cta-link.website-link__item', timeout=10000)
+    await page.wait_for_selector('a.provider__cta-link.website-link__item', timeout=15000)
   except:
     # If selector timeout, try to get whatever links are available
+    logging.warning("⚠️ Timeout waiting for business links. Continuing with available links.")
     pass
 
   # Give the page a moment to load
@@ -292,22 +375,34 @@ async def get_business_links_from_page(page):
   max_attempts = 5  # Reduced since we're only loading one page
 
   while scroll_attempts < max_attempts:
-    links = await page.query_selector_all('a.provider__cta-link.website-link__item')
-    current_count = len(links)
+    try:
+      links = await page.query_selector_all('a.provider__cta-link.website-link__item')
+      current_count = len(links)
 
-    if current_count == prev_count:
-      scroll_attempts += 1
-    else:
-      scroll_attempts = 0
+      if current_count == prev_count:
+        scroll_attempts += 1
+      else:
+        scroll_attempts = 0
 
-    prev_count = current_count
+      prev_count = current_count
+      
+      # Log progress
+      if scroll_attempts > 0:
+        logging.info(f"🔄 Scrolling to load more businesses ({scroll_attempts}/{max_attempts}), found {current_count} so far")
 
-    # Scroll down
-    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    await page.wait_for_timeout(1500)
+      # Scroll down
+      await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+      await page.wait_for_timeout(1500)
+    except Exception as e:
+      logging.warning(f"⚠️ Error while scrolling: {e}")
+      break
 
-  final_links = await page.query_selector_all('a.provider__cta-link.website-link__item')
-  return final_links
+  try:
+    final_links = await page.query_selector_all('a.provider__cta-link.website-link__item')
+    return final_links
+  except Exception as e:
+    logging.error(f"❌ Error getting final links: {e}")
+    return []
 
 
 async def process_business_links(page, links, writer, csvfile, unique_businesses):
@@ -333,40 +428,101 @@ async def process_business_links(page, links, writer, csvfile, unique_businesses
 
     # Create new page for each business
     business_page = None
-    try:
-      business_page = await page.context.new_page()
+    max_retries = 2  # Number of retry attempts
+    retry_count = 0
+    
+    while retry_count <= max_retries:
+      try:
+        business_page = await page.context.new_page()
 
-      # Navigate to business website
-      await business_page.goto(href, wait_until='networkidle', timeout=30000)
-      await business_page.wait_for_timeout(2000)
-
-      # Check for Cloudflare
-      if await is_cloudflare_active(business_page):
-        logging.info(
-          f"⚠️  Cloudflare detected for business {i+1}, skipping...")
-        continue
-
-      # Light human simulation
-      await simulate_human_behavior(business_page)
-
-      # Scrape business info
-      actual_url = business_page.url
-      entries = await scrape_business_info(business_page, actual_url, writer, csvfile, unique_businesses)
-      total_entries += entries
-
-    except Exception as e:
-      logging.error(f"❌ Error processing business {i+1}: {e}")
-    finally:
-      if business_page:
+        # Navigate to business website with proper error handling
         try:
-          await business_page.close()
-        except:
-          pass
+          # Increase timeout for navigation if this is a retry
+          timeout = 30000 if retry_count == 0 else 45000
+          
+          # Log navigation attempt
+          logging.info(f"🔗 Navigating to business {i+1}: {href}" + 
+                      (f" (Retry {retry_count})" if retry_count > 0 else ""))
+          
+          await business_page.goto(href, wait_until='domcontentloaded', timeout=timeout)
+          await business_page.wait_for_timeout(2000)
+          
+          # Check for Cloudflare
+          if await is_cloudflare_active(business_page):
+            logging.info(f"⚠️  Cloudflare detected for business {i+1}, skipping...")
+            break  # Skip this business entirely
+            
+          # Light human simulation
+          await simulate_human_behavior(business_page)
+
+          # Scrape business info
+          actual_url = business_page.url
+          entries = await scrape_business_info(business_page, actual_url, writer, csvfile, unique_businesses)
+          total_entries += entries
+          
+          # If we get here, the scraping was successful
+          break
+          
+        except Exception as nav_error:
+          if "Timeout" in str(nav_error) and retry_count < max_retries:
+            retry_count += 1
+            logging.warning(f"⚠️ Timeout navigating to business {i+1}, retrying ({retry_count}/{max_retries})...")
+            
+            # Close current page before retry
+            if business_page:
+              try:
+                await business_page.close()
+                business_page = None
+              except:
+                pass
+              
+            # Wait before retrying
+            await asyncio.sleep(random.uniform(3, 5))
+            continue  # Try again
+          else:
+            # Either it's not a timeout error or we've exceeded retries
+            logging.error(f"❌ Error processing business {i+1}: {nav_error}")
+            break  # Exit the retry loop
+
+      except Exception as e:
+        logging.error(f"❌ Error creating page for business {i+1}: {e}")
+        break
+        
+      finally:
+        if business_page:
+          try:
+            await business_page.close()
+          except:
+            pass
 
     # Small delay between businesses
     await asyncio.sleep(random.uniform(1, 3))
 
   return total_entries
+
+
+async def read_base_urls():
+  """Read base URLs from the scrape_urls.txt file"""
+  urls = []
+  try:
+    with open('scrape_urls.txt', 'r') as f:
+      for line in f:
+        url = line.strip()
+        if url and not url.startswith('#'):  # Skip empty lines and comments
+          urls.append(url)
+    
+    if not urls:
+      # Fall back to default URL if file is empty
+      logging.warning("⚠️ No URLs found in scrape_urls.txt, using default URL")
+      urls = ['https://clutch.co/affiliate-marketing/facebook']
+    
+    return urls
+  except FileNotFoundError:
+    logging.warning("⚠️ scrape_urls.txt not found, using default URL")
+    return ['https://clutch.co/affiliate-marketing/facebook']
+  except Exception as e:
+    logging.error(f"❌ Error reading scrape_urls.txt: {e}")
+    return ['https://clutch.co/affiliate-marketing/facebook']
 
 
 async def main():
@@ -402,158 +558,67 @@ async def main():
     page = await context.new_page()
 
     try:
-      # Base URL for pagination
-      base_url = 'https://clutch.co/affiliate-marketing/facebook'
+      # Read URLs from file
+      base_urls = await read_base_urls()
+      logging.info(f"📋 Found {len(base_urls)} URLs to scrape: {', '.join(base_urls)}")
 
       # Process businesses and save to CSV
       unique_businesses = set()
       total_entries = 0
       total_businesses_found = 0
-      current_page = 1
-
+      
       with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
         fieldnames = ['website_url', 'business_name', 'email', 'phone']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
         logging.info(f"📝 Created CSV file: {csv_filename}")
 
-        # Process pages sequentially
-        while True:
-          # Construct URL for current page
-          if current_page == 1:
-            page_url = base_url
-          else:
-            page_url = f"{base_url}?page={current_page}"
-
-          logging.info(f"🌐 Processing page {current_page}: {page_url}")
-
+        for start_url in base_urls:
           try:
-            # Navigate to the page
-            await page.goto(page_url, wait_until='networkidle', timeout=60000)
-            await page.wait_for_timeout(3000)
+            # Navigate to the starting URL
+            await page.goto(start_url, wait_until='domcontentloaded')
 
-            # Initial human behavior
+            # Give time for the page to load
+            await page.wait_for_timeout(5000)
+
+            # Check for Cloudflare
+            if await is_cloudflare_active(page):
+              logging.info("⚠️ Cloudflare challenge detected, skipping this URL")
+              continue  # Skip this URL entirely
+            
+            # Light human simulation
             await simulate_human_behavior(page)
 
-            # Get business links from current page
-            links = await get_business_links_from_page(page)
+            # Get business links from the page
+            business_links = await get_business_links_from_page(page)
 
-            # If no businesses found, we've reached the end
-            if not links or len(links) == 0:
-              logging.info(
-                f"❌ No businesses found on page {current_page}. Pagination complete.")
-              break
-
-            logging.info(
-              f"📋 Found {len(links)} businesses on page {current_page}")
-            total_businesses_found += len(links)
-
-            # Process businesses from this page
-            page_entries = await process_business_links(page, links, writer, csvfile, unique_businesses)
-            total_entries += page_entries
-
-            logging.info(
-              f"✅ Completed page {current_page}. Entries from this page: {page_entries}")
-
-            # Check if we should continue to next page
-            # If we found very few businesses (less than 10), might be the last page
-            if len(links) < 10:
-              logging.info(
-                f"⚠️  Found only {len(links)} businesses on page {current_page}. This might be the last page.")
-              # Try one more page to confirm
-              next_page_test = current_page + 1
-              next_page_url = f"{base_url}?page={next_page_test}"
-
-              try:
-                await page.goto(next_page_url, wait_until='networkidle', timeout=30000)
-                await page.wait_for_timeout(2000)
-                test_links = await page.query_selector_all('a.provider__cta-link.website-link__item')
-
-                if not test_links or len(test_links) == 0:
-                  logging.info(
-                    f"✅ Confirmed: No businesses on page {next_page_test}. Pagination complete.")
-                  break
-                else:
-                  logging.info(
-                    f"🔄 Found {len(test_links)} businesses on page {next_page_test}. Continuing...")
-                  # Go back to process this page normally
-                  current_page = next_page_test
-                  continue
-              except:
-                logging.info(
-                  f"❌ Could not access page {next_page_test}. Assuming pagination complete.")
-                break
-
-            # Move to next page
-            current_page += 1
-
-            # Add delay between pages to be respectful
-            await asyncio.sleep(random.uniform(2, 4))
-
-          except Exception as e:
-            logging.error(f"❌ Error processing page {current_page}: {e}")
-
-            # Try to continue to next page in case this was just a temporary issue
-            if current_page <= 3:  # Only try to skip for first few pages
-              logging.info(
-                f"⚠️  Attempting to continue to page {current_page + 1}...")
-              current_page += 1
-              await asyncio.sleep(5)  # Longer delay after error
+            # If no links found, log and skip
+            if not business_links:
+              logging.info("🔍 No business links found on this page")
               continue
-            else:
-              # If we're on later pages and get an error, probably reached the end
-              logging.info(f"❌ Multiple errors or reached end of pagination.")
-              break
 
-      # Final summary
-      logging.info(f"\n" + "=" * 60)
-      logging.info(f"✅ SCRAPING COMPLETED SUCCESSFULLY")
-      logging.info(f"=" * 60)
-      logging.info(f"📄 Total pages processed: {current_page - 1}")
-      logging.info(f"🏢 Total businesses found: {total_businesses_found}")
-      logging.info(f"📊 Total entries written: {total_entries}")
-      logging.info(f"🔍 Unique businesses: {len(unique_businesses)}")
-      logging.info(f"💾 Data saved to: {csv_filename}")
-      logging.info(f"=" * 60)
+            # Process the business links
+            entries = await process_business_links(page, business_links, writer, csvfile, unique_businesses)
+            total_entries += entries
+            total_businesses_found += len(business_links)
+            
+            logging.info(f"✅ Found and processed {len(business_links)} businesses")
+            
+          except Exception as e:
+            logging.error(f"Error processing URL {start_url}: {e}")
 
-      logging.info(
-        f"🎉 Scraping completed successfully! Total pages: {current_page - 1}, Total entries: {total_entries}")
+      logging.info(f"🎉 Scraping completed! Total entries: {total_entries}")
 
     except Exception as e:
-      logging.error(f"Main error: {e}")
-      logging.error(f"Error: {e}")
+      logging.error(f"Error in main processing: {e}")
+
     finally:
-      await asyncio.sleep(5)  # Brief pause before closing
+      await page.close()
+      await context.close()
       await browser.close()
-      logging.info("Browser closed.")
+
+  logging.info("✅ Browser closed, exiting program.")
 
 
-def clean_url(url):
-  """Clean URL by removing UTM parameters and other tracking parameters"""
-  if not url:
-    return url
-
-  try:
-    from urllib.parse import urlparse, urlunparse, parse_qs
-
-    parsed = urlparse(url)
-
-    # Remove query parameters (everything after ?)
-    clean_parsed = parsed._replace(query='', fragment='')
-
-    # Reconstruct the clean URL
-    clean_url = urlunparse(clean_parsed)
-
-    # Remove trailing slash if present
-    if clean_url.endswith('/'):
-      clean_url = clean_url[:-1]
-
-    return clean_url
-
-  except Exception as e:
-    logging.error(f"Error cleaning URL {url}: {e}")
-    return url
-
-
-if __name__ == '__main__':
-  asyncio.run(main())
+# Run the scraper
+asyncio.run(main())
