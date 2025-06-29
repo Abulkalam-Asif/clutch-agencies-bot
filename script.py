@@ -318,15 +318,10 @@ async def scrape_business_info(page, url, writer, csvfile, unique_businesses):
     if not business_name.strip():
       return 0
 
-    # Make sure unique_businesses checks are thread-safe
-    # Since we're using a shared set with parallel execution
-    business_name_key = business_name.lower()  # Normalize for comparison
-    
-    # Skip duplicates - using a more thread-safe approach
-    # Check-then-add approach needs to be atomic in a parallel context
-    if business_name_key in unique_businesses:
+    # Skip duplicates
+    if business_name in unique_businesses:
       return 0
-    unique_businesses.add(business_name_key)
+    unique_businesses.add(business_name)
 
     # Extract contact info
     emails = await extract_emails(page)  # Now returns max 1 email
@@ -336,8 +331,7 @@ async def scrape_business_info(page, url, writer, csvfile, unique_businesses):
     email = emails[0] if emails else ""
     phone = phones[0] if phones else ""
     
-    # Since we're running in parallel, we need to make sure the CSV writing is thread-safe
-    # The lock is handled in the calling function (process_business_links)
+    # Write to CSV - one row per website with at most one email and one phone
     writer.writerow({
         'website_url': clean_website_url,
         'business_name': business_name,
@@ -412,60 +406,99 @@ async def get_business_links_from_page(page):
 
 
 async def process_business_links(page, links, writer, csvfile, unique_businesses):
-  """Process all business links from current page in parallel"""
+  """Process all business links from current page"""
+  total_entries = 0
   processed_urls = set()
-  tasks = []
-  
+
   if not links:
     return 0
 
-  # Configure the maximum number of concurrent tasks
-  # Adjust this value based on your system capabilities and website limitations
-  max_concurrent_tasks = 10
-  semaphore = asyncio.Semaphore(max_concurrent_tasks)
+  logging.info(f"🚀 Processing {len(links)} businesses from current page...")
 
-  # Create a lock for thread-safe CSV writing
-  csv_lock = asyncio.Lock()
-
-  # Modified scrape_business_info function with locking
-  async def safe_scrape_business_info(page, url, writer, csvfile, unique_businesses_shared):
-    async with csv_lock:
-      return await scrape_business_info(page, url, writer, csvfile, unique_businesses_shared)
-
-  # Wrapper function for processing with semaphore
-  async def process_with_semaphore(context, href, index, total):
-    async with semaphore:
-      return await process_single_business(context, href, writer, csvfile, unique_businesses, index, total)
-
-  logging.info(f"🚀 Processing {len(links)} businesses from current page using parallel processing (max {max_concurrent_tasks} concurrent)...")
-
-  # Collect URLs to process
-  urls_to_process = []
   for i, link in enumerate(links):
     href = await link.get_attribute('href')
     if not href or href in processed_urls:
       continue
+
     processed_urls.add(href)
-    urls_to_process.append((i, href))
 
-  # Create tasks for parallel processing
-  for i, href in urls_to_process:
-    task = asyncio.create_task(
-      process_with_semaphore(page.context, href, i, len(links))
-    )
-    tasks.append(task)
+    # Log progress every 5 businesses for more frequent updates
+    if i % 5 == 0 or i == len(links) - 1:
+      logging.info(f"📊 Page progress: {i+1}/{len(links)} businesses processed")
 
-  # Wait for all tasks to complete and collect results
-  if tasks:
-    results = await asyncio.gather(*tasks)
-    total_entries = sum(results)
+    # Create new page for each business
+    business_page = None
+    max_retries = 2  # Number of retry attempts
+    retry_count = 0
     
-    # Log completion
-    logging.info(f"✅ Completed parallel processing of {len(tasks)} businesses")
-    
-    return total_entries
-  else:
-    return 0
+    while retry_count <= max_retries:
+      try:
+        business_page = await page.context.new_page()
+
+        # Navigate to business website with proper error handling
+        try:
+          # Increase timeout for navigation if this is a retry
+          timeout = 30000 if retry_count == 0 else 45000
+          
+          # Log navigation attempt
+          logging.info(f"🔗 Navigating to business {i+1}: {href}" + 
+                      (f" (Retry {retry_count})" if retry_count > 0 else ""))
+          
+          await business_page.goto(href, wait_until='domcontentloaded', timeout=timeout)
+          await business_page.wait_for_timeout(2000)
+          
+          # Check for Cloudflare
+          if await is_cloudflare_active(business_page):
+            logging.info(f"⚠️  Cloudflare detected for business {i+1}, skipping...")
+            break  # Skip this business entirely
+            
+          # Light human simulation
+          await simulate_human_behavior(business_page)
+
+          # Scrape business info
+          actual_url = business_page.url
+          entries = await scrape_business_info(business_page, actual_url, writer, csvfile, unique_businesses)
+          total_entries += entries
+          
+          # If we get here, the scraping was successful
+          break
+          
+        except Exception as nav_error:
+          if "Timeout" in str(nav_error) and retry_count < max_retries:
+            retry_count += 1
+            logging.warning(f"⚠️ Timeout navigating to business {i+1}, retrying ({retry_count}/{max_retries})...")
+            
+            # Close current page before retry
+            if business_page:
+              try:
+                await business_page.close()
+                business_page = None
+              except:
+                pass
+              
+            # Wait before retrying
+            await asyncio.sleep(random.uniform(3, 5))
+            continue  # Try again
+          else:
+            # Either it's not a timeout error or we've exceeded retries
+            logging.error(f"❌ Error processing business {i+1}: {nav_error}")
+            break  # Exit the retry loop
+
+      except Exception as e:
+        logging.error(f"❌ Error creating page for business {i+1}: {e}")
+        break
+        
+      finally:
+        if business_page:
+          try:
+            await business_page.close()
+          except:
+            pass
+
+    # Small delay between businesses
+    await asyncio.sleep(random.uniform(1, 3))
+
+  return total_entries
 
 
 async def read_base_urls():
@@ -492,87 +525,10 @@ async def read_base_urls():
     return ['https://clutch.co/affiliate-marketing/facebook']
 
 
-async def process_single_business(page_context, href, writer, csvfile, unique_businesses, index, total_links):
-  """Process a single business link and scrape its information"""
-  business_page = None
-  max_retries = 2
-  retry_count = 0
-  
-  while retry_count <= max_retries:
-    try:
-      business_page = await page_context.new_page()
-
-      # Navigate to business website with proper error handling
-      try:
-        # Increase timeout for navigation if this is a retry
-        timeout = 30000 if retry_count == 0 else 45000
-        
-        # Log navigation attempt
-        logging.info(f"🔗 Navigating to business {index+1}/{total_links}: {href}" + 
-                    (f" (Retry {retry_count})" if retry_count > 0 else ""))
-        
-        await business_page.goto(href, wait_until='domcontentloaded', timeout=timeout)
-        await business_page.wait_for_timeout(2000)
-        
-        # Check for Cloudflare
-        if await is_cloudflare_active(business_page):
-          logging.info(f"⚠️  Cloudflare detected for business {index+1}, skipping...")
-          return 0  # Skip this business entirely
-          
-        # Light human simulation
-        await simulate_human_behavior(business_page)
-
-        # Scrape business info
-        actual_url = business_page.url
-        entries = await scrape_business_info(business_page, actual_url, writer, csvfile, unique_businesses)
-        
-        # If we get here, the scraping was successful
-        return entries
-        
-      except Exception as nav_error:
-        if "Timeout" in str(nav_error) and retry_count < max_retries:
-          retry_count += 1
-          logging.warning(f"⚠️ Timeout navigating to business {index+1}, retrying ({retry_count}/{max_retries})...")
-          
-          # Close current page before retry
-          if business_page:
-            try:
-              await business_page.close()
-              business_page = None
-            except:
-              pass
-            
-          # Wait before retrying
-          await asyncio.sleep(random.uniform(3, 5))
-          continue  # Try again
-        else:
-          # Either it's not a timeout error or we've exceeded retries
-          logging.error(f"❌ Error processing business {index+1}: {nav_error}")
-          return 0  # Exit the retry loop
-
-    except Exception as e:
-      logging.error(f"❌ Error creating page for business {index+1}: {e}")
-      return 0
-      
-    finally:
-      if business_page:
-        try:
-          await business_page.close()
-        except:
-          pass
-  
-  return 0  # Default return if all attempts fail
-
-
 async def main():
   """Main function"""
-  # Configure the maximum parallel business pages to process
-  # Adjust based on your system capabilities and to avoid being rate-limited
-  MAX_CONCURRENT_BUSINESS_PAGES = 10
-  
   log_filename = setup_logging()
-  logging.info(f"🚀 Starting web scraper with parallel processing - Log file: {log_filename}")
-  logging.info(f"⚙️ Max concurrent business pages: {MAX_CONCURRENT_BUSINESS_PAGES}")
+  logging.info(f"🚀 Starting web scraper - Log file: {log_filename}")
 
   # Create output directory
   output_dir = 'scraped_data'
@@ -590,31 +546,14 @@ async def main():
         args=[
             '--no-sandbox',
             '--disable-blink-features=AutomationControlled',
-            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            # Add these options to optimize browser performance with multiple pages
-            '--disable-dev-shm-usage',  # Overcome limited /dev/shm size in containers
-            '--disable-gpu',  # Disable GPU hardware acceleration
-            '--disable-setuid-sandbox',
-            '--disable-extensions',  # Disable extensions for better performance
-            '--disable-background-timer-throttling',  # Improve timer accuracy
-            '--disable-backgrounding-occluded-windows',
-            '--disable-renderer-backgrounding',  # Prevent throttling of background tabs
+            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         ]
     )
 
-    # Create a persistent context with optimized settings for parallel processing
     context = await browser.new_context(
         viewport={'width': 1366, 'height': 768},
-        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        # Set a lower JavaScript memory limit to reduce memory usage
-        java_script_enabled=True,
-        # These settings help with performance in parallel processing
-        bypass_csp=True,  # Avoid content security policy issues
-        ignore_https_errors=True  # Ignore HTTPS errors that might slow down navigation
+        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     )
-    
-    # Allow more concurrent connections to improve parallel processing
-    await context.route('**', lambda route: route.continue_())
 
     page = await context.new_page()
 
@@ -637,7 +576,6 @@ async def main():
         for start_url in base_urls:
           try:
             # Navigate to the starting URL
-            logging.info(f"🔍 Navigating to start URL: {start_url}")
             await page.goto(start_url, wait_until='domcontentloaded')
 
             # Give time for the page to load
@@ -659,13 +597,12 @@ async def main():
               logging.info("🔍 No business links found on this page")
               continue
 
-            # Process the business links in parallel
-            logging.info(f"⚡ Processing {len(business_links)} businesses in parallel (max {MAX_CONCURRENT_BUSINESS_PAGES} concurrent)...")
+            # Process the business links
             entries = await process_business_links(page, business_links, writer, csvfile, unique_businesses)
             total_entries += entries
             total_businesses_found += len(business_links)
             
-            logging.info(f"✅ Found and processed {len(business_links)} businesses, {entries} entries saved")
+            logging.info(f"✅ Found and processed {len(business_links)} businesses")
             
           except Exception as e:
             logging.error(f"Error processing URL {start_url}: {e}")
