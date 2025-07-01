@@ -1372,22 +1372,13 @@ async def is_valid_results_page(page):
       except:
         pass
     
-    # For Clutch.co, simply having business links is enough to consider the page valid
-    # even if they're the same as a previous page
-    try:
-      clutch_links = await page.query_selector_all('a[href*="r.clutch.co/redirect"]')
-      if clutch_links and len(clutch_links) > 0:
-        logging.info(f"✅ Found {len(clutch_links)} Clutch.co redirect links - considering page valid")
-        return True
-    except:
-      pass
-    
     # Check for presence of business listings or pagination
     valid_content_selectors = [
       '.provider-info', 
       '.providers-directory', 
       '.listing-companies',
       '.pagination',
+      'a[href*="r.clutch.co/redirect"]',
       '.listing-item',
       '.provider-row'
     ]
