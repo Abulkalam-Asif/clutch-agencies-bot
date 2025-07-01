@@ -598,7 +598,8 @@ async def get_business_links_from_page(page):
 
 
 async def has_next_page(page):
-  """Enhanced check for next page button with multiple selectors specifically optimized for Clutch.co"""
+  """Enhanced check for next page button with multiple selectors specifically optimized for Clutch.co
+  Returns the next button element if it exists and is not disabled, None otherwise."""
   selectors = [
     'a.page-item.next', # Main Clutch.co pagination next button
     'a.page-link[rel="next"]',
@@ -615,6 +616,27 @@ async def has_next_page(page):
     '.pagination__next'
   ]
   
+  # First, check for disabled next buttons (more accurate detection of end of pages)
+  try:
+    # Check for visible but disabled next buttons - if we find these, we're definitely at the last page
+    disabled_selectors = [
+      '.pagination .page-item.next.disabled',
+      '.pagination .page-item.disabled:has(a:has-text("Next"))',
+      'a.page-link[rel="next"][aria-disabled="true"]',
+      '.pagination .page-item.disabled a[aria-label="Next"]',
+      'li.pager-next.disabled',  # Common Drupal pagination used by Clutch.co
+      'li.pager-item.pager-next.disabled'
+    ]
+    
+    for selector in disabled_selectors:
+      disabled_next = await page.query_selector(selector)
+      if disabled_next and await disabled_next.is_visible():
+        logging.info(f"🛑 Found disabled next button with selector: {selector} - Reached last page")
+        return None  # We found a disabled next button - definitely at the last page
+  except Exception as e:
+    logging.warning(f"Error checking for disabled next buttons: {e}")
+  
+  # If we didn't find a disabled next button, look for an enabled one
   try:
     for selector in selectors:
       next_button = await page.query_selector(selector)
@@ -640,6 +662,11 @@ async def has_next_page(page):
         if aria_disabled and aria_disabled.lower() == "true":
           is_disabled = True
         
+        # Check if href is empty or just "#" - often indicates disabled
+        href = await next_button.get_attribute('href')
+        if not href or href == "#":
+          is_disabled = True
+        
         # For Clutch.co specifically, check the clickability of the button
         try:
           is_clickable = await page.evaluate("""(button) => {
@@ -655,20 +682,22 @@ async def has_next_page(page):
         
         if is_visible and not is_disabled:
           logging.info(f"✅ Found next page button with selector: {selector}")
-          # Return both the button and whether it's on the last page
           return next_button
+        elif is_visible and is_disabled:
+          logging.info(f"🛑 Found visible but disabled next button with selector: {selector} - Reached last page")
+          return None  # Return None to indicate end of pagination
     
     # If no selector worked, try a more generic approach for Clutch.co
     # Look for pagination elements and find the active one to determine if there's a next page
     try:
       # Get all pagination items
-      pagination_items = await page.query_selector_all('.pagination .page-item')
+      pagination_items = await page.query_selector_all('.pagination .page-item, .pager-item')
       if pagination_items and len(pagination_items) > 0:
         # Find the active item
         active_index = -1
         for i, item in enumerate(pagination_items):
           class_attr = await item.get_attribute('class') or ""
-          if "active" in class_attr:
+          if "active" in class_attr or "pager-current" in class_attr:
             active_index = i
             break
         
@@ -701,23 +730,34 @@ async def has_next_page(page):
     except Exception as e:
       logging.error(f"Error during pagination analysis: {e}")
     
-    # Additional check: look for disabled next buttons
+    # Last attempt: check if we're on the last page by analyzing the URL and page numbers
     try:
-      # Check for visible but disabled next buttons
-      disabled_selectors = [
-        '.pagination .page-item.next.disabled',
-        '.pagination .page-item.disabled:has(a:has-text("Next"))',
-        'a.page-link[rel="next"][aria-disabled="true"]',
-        '.pagination .page-item.disabled a[aria-label="Next"]'
-      ]
+      # Check URL for page parameter
+      current_url = page.url
+      current_page_match = re.search(r'page=(\d+)', current_url)
       
-      for selector in disabled_selectors:
-        disabled_next = await page.query_selector(selector)
-        if disabled_next and await disabled_next.is_visible():
-          logging.info(f"🛑 Found disabled next button with selector: {selector} - Reached last page")
+      if current_page_match:
+        current_page_num = int(current_page_match.group(1))
+        
+        # Try to find the highest page number in pagination
+        max_page_num = current_page_num  # Default to current
+        page_links = await page.query_selector_all('.pagination a, .pager a')
+        
+        for link in page_links:
+          try:
+            href = await link.get_attribute('href') or ""
+            page_match = re.search(r'page=(\d+)', href)
+            if page_match:
+              page_num = int(page_match.group(1))
+              max_page_num = max(max_page_num, page_num)
+          except:
+            pass
+        
+        if current_page_num >= max_page_num:
+          logging.info(f"🛑 Current page {current_page_num} appears to be the last page based on URL analysis")
           return None
     except Exception as e:
-      logging.warning(f"Error checking for disabled next buttons: {e}")
+      logging.warning(f"Error during URL pagination analysis: {e}")
       
     # If we get here, no next button was found
     logging.info("❌ No next page button found")
@@ -998,7 +1038,7 @@ async def scrape_all_pages(page, start_url, writer, csvfile, unique_businesses):
   consecutive_navigation_failures = 0
   max_navigation_failures = 2  # Stop if we can't navigate properly multiple times
   consecutive_duplicate_pages = 0
-  max_duplicate_pages = 2  # Stop if we find mostly duplicates on consecutive pages
+  # No longer using max_duplicate_pages as a stopping condition
   
   # Navigate to start URL
   try:
@@ -1127,28 +1167,20 @@ async def scrape_all_pages(page, start_url, writer, csvfile, unique_businesses):
     new_unique_count = len(unique_businesses)
     new_businesses_found = new_unique_count - original_unique_count
     
-    # Check if this page has mostly duplicate businesses
-    if page_num > 1 and new_businesses_found < 3 and len(business_links) > 5:
-      consecutive_duplicate_pages += 1
-      
-      # Calculate percentage of duplicates for better decision making
+    # Track duplicate statistics but don't stop pagination based on duplicates
+    if page_num > 1 and len(business_links) > 0:
+      # Calculate percentage of duplicates for informational purposes
       duplicate_percentage = 100 - ((new_businesses_found / len(business_links)) * 100)
-      logging.warning(f"⚠️ Page {page_num}: Only found {new_businesses_found} new businesses out of {len(business_links)} links ({duplicate_percentage:.1f}% duplicates)")
       
-      # Allow more consecutive pages with duplicates, but still stop if extremely high duplication
-      max_duplicate_pages = 4  # Increased from 2 to 4
-      
-      # Add higher threshold for stopping if almost all are duplicates
-      extreme_duplicate_threshold = 95  # Stop immediately if 95% or more are duplicates
-      
-      if consecutive_duplicate_pages >= max_duplicate_pages or duplicate_percentage >= extreme_duplicate_threshold:
-        logging.info(f"🛑 Stopping pagination: {consecutive_duplicate_pages} consecutive pages with high duplicate rate ({duplicate_percentage:.1f}%)")
-        break
-    else:
-      # Reset counter if we found enough new businesses (more than 3 or 20% of the links)
-      if new_businesses_found > 3 or (len(business_links) > 0 and (new_businesses_found / len(business_links) >= 0.2)):
-        consecutive_duplicate_pages = 0  # Reset counter
-        logging.info(f"✅ Found {new_businesses_found} new businesses ({(new_businesses_found / len(business_links) * 100):.1f}% of total) - resetting duplicate counter")
+      if new_businesses_found < 3 and len(business_links) > 5:
+        consecutive_duplicate_pages += 1
+        logging.warning(f"⚠️ Page {page_num}: Found {new_businesses_found} new businesses out of {len(business_links)} links ({duplicate_percentage:.1f}% duplicates)")
+        logging.info(f"� Consecutive pages with high duplicates: {consecutive_duplicate_pages} - continuing pagination")
+      else:
+        # Reset counter if we found enough new businesses (more than 3 or 20% of the links)
+        if new_businesses_found > 3 or (len(business_links) > 0 and (new_businesses_found / len(business_links) >= 0.2)):
+          consecutive_duplicate_pages = 0  # Reset counter
+          logging.info(f"✅ Found {new_businesses_found} new businesses ({(new_businesses_found / len(business_links) * 100):.1f}% of total) - resetting duplicate counter")
     
     total_entries += entries
     total_businesses_found += len(business_links)
@@ -1158,7 +1190,7 @@ async def scrape_all_pages(page, start_url, writer, csvfile, unique_businesses):
     # Check if there's a next page with our improved function
     next_button = await has_next_page(page)
     if not next_button:
-      logging.info(f"🏁 Reached the last page ({page_num}) for {start_url}")
+      logging.info(f"🏁 Reached the last page ({page_num}) for {start_url} - Next button is disabled or doesn't exist")
       
       # Take a screenshot of the last page for verification
       try:
@@ -1168,7 +1200,7 @@ async def scrape_all_pages(page, start_url, writer, csvfile, unique_businesses):
       except:
         pass
         
-      break
+      break  # Only stop pagination when Next button is disabled or doesn't exist
     
     # Navigate to the next page with our improved function
     navigation_success = await navigate_to_next_page(page)
@@ -1178,6 +1210,18 @@ async def scrape_all_pages(page, start_url, writer, csvfile, unique_businesses):
       
       if consecutive_navigation_failures >= max_navigation_failures:
         logging.info(f"🛑 {max_navigation_failures} consecutive navigation failures, stopping pagination")
+        
+        # Even after navigation failures, check if we can find a disabled next button
+        # to confirm we've actually reached the end of pagination
+        try:
+          disabled_next = await page.query_selector('.pagination .page-item.next.disabled, li.pager-next.disabled')
+          if disabled_next and await disabled_next.is_visible():
+            logging.info("✅ Confirmed we're at the last page (found disabled next button)")
+          else:
+            logging.warning("⚠️ Navigation failed but no disabled next button found - may have missed some pages")
+        except:
+          pass
+          
         break
         
       # For Clutch.co, try a direct URL approach as last resort
@@ -1218,16 +1262,55 @@ async def scrape_all_pages(page, start_url, writer, csvfile, unique_businesses):
 
 
 async def verify_unique_page_content(page, current_page_num):
-  """Verify that the page content is unique compared to previously visited pages"""
+  """Verify that the page content is unique compared to previously visited pages
+  Returns True if the content is unique, False if duplicate"""
   try:
-    # Sample business links from the page for fingerprinting
-    sample_links = await page.evaluate("""() => {
-      const links = Array.from(document.querySelectorAll('a[href*="r.clutch.co/redirect"]')).slice(0, 10);
-      return links.map(a => a.href || '');
-    }""")
+    # Sample business links from the page for fingerprinting - try multiple selectors
+    sample_links = []
     
-    # If we have enough links, create a fingerprint
-    if len(sample_links) >= 3:
+    # Try Clutch.co redirect links first
+    try:
+      clutch_links = await page.evaluate("""() => {
+        const links = Array.from(document.querySelectorAll('a[href*="r.clutch.co/redirect"]')).slice(0, 15);
+        return links.map(a => a.href || '');
+      }""")
+      if clutch_links and len(clutch_links) > 0:
+        sample_links = clutch_links
+    except Exception:
+      pass
+      
+    # If no Clutch redirect links found, try business names
+    if not sample_links:
+      try:
+        business_names = await page.evaluate("""() => {
+          const elements = Array.from(document.querySelectorAll('.provider-info h3, .provider-name, .company-name, .listing-item h3')).slice(0, 15);
+          return elements.map(el => el.textContent.trim());
+        }""")
+        if business_names and len(business_names) > 0:
+          sample_links = business_names
+      except Exception:
+        pass
+    
+    # If still nothing, try any external links
+    if not sample_links:
+      try:
+        external_links = await page.evaluate("""() => {
+          const links = Array.from(document.querySelectorAll('a[href^="http"]')).slice(0, 20);
+          return links.map(a => a.href || '').filter(href => 
+            !href.includes('clutch.co/directories') && 
+            !href.includes('clutch.co/profile') &&
+            !href.includes('facebook.com') &&
+            !href.includes('twitter.com') &&
+            !href.includes('linkedin.com')
+          );
+        }""")
+        if external_links and len(external_links) > 0:
+          sample_links = external_links
+      except Exception:
+        pass
+    
+    # If we have enough data, create a fingerprint
+    if sample_links and len(sample_links) >= 3:
       fingerprint = "|".join(sorted(sample_links))
       
       # Initialize page fingerprints if not exists
@@ -1236,13 +1319,17 @@ async def verify_unique_page_content(page, current_page_num):
       
       # Check if we've seen this content before
       if fingerprint in page.previous_page_fingerprints:
-        logging.warning(f"⚠️ Page {current_page_num} content appears to be a duplicate of a previous page")
+        duplicate_percent = round((len(sample_links) / len(sample_links)) * 100, 1)
+        logging.warning(f"⚠️ Page {current_page_num} content appears to be a duplicate of a previous page ({duplicate_percent}% match)")
         return False
       
       # Store fingerprint for future comparison
       page.previous_page_fingerprints.add(fingerprint)
+      logging.info(f"✅ Page {current_page_num} content is unique (based on {len(sample_links)} sample links/items)")
+    else:
+      logging.warning(f"⚠️ Not enough content found on page {current_page_num} to verify uniqueness")
       
-    return True
+    return True  # Continue if we can't determine uniqueness
   except Exception as e:
     logging.error(f"Error verifying page uniqueness: {e}")
     return True  # Continue on error
