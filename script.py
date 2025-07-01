@@ -899,11 +899,32 @@ async def navigate_to_next_page(page):
       new_url = page.url
       new_page_num = await extract_current_page_number(page)
       
+      # Add content hash verification to confirm we have different content
+      content_hash = await page.evaluate("""() => {
+        // Get the first few business items on the page
+        const items = Array.from(document.querySelectorAll('.provider-info, .listing-companies a[href*="r.clutch.co/redirect"]')).slice(0, 5);
+        return items.map(el => el.textContent || el.href || '').join('|');
+      }""")
+      
+      if hasattr(page, 'content_hash_previous_page') and content_hash == page.content_hash_previous_page:
+        logging.warning("⚠️ Page content appears identical to previous page despite URL change")
+        
+      # Store current hash for next comparison
+      page.content_hash_previous_page = content_hash
+      
       # Verify we're on a valid results page
       is_valid_page = await is_valid_results_page(page)
+      
+      # Check if this is a unique page we haven't seen before
+      is_unique_content = await verify_unique_page_content(page, new_page_num)
       if not is_valid_page:
         logging.warning("⚠️ Navigation led to an invalid page (possibly a 'No Results' or error page)")
         return False
+      
+      if not is_unique_content:
+        logging.warning("⚠️ Navigation led to a duplicate page we've seen before")
+        # We still return True because we did navigate, just to a duplicate page
+        # The main scraping loop will handle this with the consecutive_duplicate_pages logic
       
       if new_url == current_url and new_page_num == current_page_num:
         logging.warning("⚠️ URL and page number did not change after navigation attempt")
@@ -947,7 +968,6 @@ async def navigate_to_next_page(page):
           else:
             logging.error("❌ All navigation attempts failed")
             return False
-      
       # Give the page time to stabilize and simulate human behavior
       await page.wait_for_timeout(3000)
       await simulate_human_behavior(page)
@@ -1110,12 +1130,25 @@ async def scrape_all_pages(page, start_url, writer, csvfile, unique_businesses):
     # Check if this page has mostly duplicate businesses
     if page_num > 1 and new_businesses_found < 3 and len(business_links) > 5:
       consecutive_duplicate_pages += 1
-      logging.warning(f"⚠️ Page {page_num}: Only found {new_businesses_found} new businesses out of {len(business_links)} links")
-      if consecutive_duplicate_pages >= max_duplicate_pages:
-        logging.info(f"🛑 {max_duplicate_pages} consecutive pages with few new businesses, stopping pagination")
+      
+      # Calculate percentage of duplicates for better decision making
+      duplicate_percentage = 100 - ((new_businesses_found / len(business_links)) * 100)
+      logging.warning(f"⚠️ Page {page_num}: Only found {new_businesses_found} new businesses out of {len(business_links)} links ({duplicate_percentage:.1f}% duplicates)")
+      
+      # Allow more consecutive pages with duplicates, but still stop if extremely high duplication
+      max_duplicate_pages = 4  # Increased from 2 to 4
+      
+      # Add higher threshold for stopping if almost all are duplicates
+      extreme_duplicate_threshold = 95  # Stop immediately if 95% or more are duplicates
+      
+      if consecutive_duplicate_pages >= max_duplicate_pages or duplicate_percentage >= extreme_duplicate_threshold:
+        logging.info(f"🛑 Stopping pagination: {consecutive_duplicate_pages} consecutive pages with high duplicate rate ({duplicate_percentage:.1f}%)")
         break
     else:
-      consecutive_duplicate_pages = 0  # Reset if we found new businesses
+      # Reset counter if we found enough new businesses (more than 3 or 20% of the links)
+      if new_businesses_found > 3 or (len(business_links) > 0 and (new_businesses_found / len(business_links) >= 0.2)):
+        consecutive_duplicate_pages = 0  # Reset counter
+        logging.info(f"✅ Found {new_businesses_found} new businesses ({(new_businesses_found / len(business_links) * 100):.1f}% of total) - resetting duplicate counter")
     
     total_entries += entries
     total_businesses_found += len(business_links)
@@ -1182,6 +1215,37 @@ async def scrape_all_pages(page, start_url, writer, csvfile, unique_businesses):
     
   logging.info(f"📊 Finished scraping {start_url}: {total_businesses_found} businesses found across {page_num} pages")
   return total_entries, total_businesses_found
+
+
+async def verify_unique_page_content(page, current_page_num):
+  """Verify that the page content is unique compared to previously visited pages"""
+  try:
+    # Sample business links from the page for fingerprinting
+    sample_links = await page.evaluate("""() => {
+      const links = Array.from(document.querySelectorAll('a[href*="r.clutch.co/redirect"]')).slice(0, 10);
+      return links.map(a => a.href || '');
+    }""")
+    
+    # If we have enough links, create a fingerprint
+    if len(sample_links) >= 3:
+      fingerprint = "|".join(sorted(sample_links))
+      
+      # Initialize page fingerprints if not exists
+      if not hasattr(page, 'previous_page_fingerprints'):
+        page.previous_page_fingerprints = set()
+      
+      # Check if we've seen this content before
+      if fingerprint in page.previous_page_fingerprints:
+        logging.warning(f"⚠️ Page {current_page_num} content appears to be a duplicate of a previous page")
+        return False
+      
+      # Store fingerprint for future comparison
+      page.previous_page_fingerprints.add(fingerprint)
+      
+    return True
+  except Exception as e:
+    logging.error(f"Error verifying page uniqueness: {e}")
+    return True  # Continue on error
 
 
 async def process_single_business(i, link, page_context, writer, csvfile, unique_businesses, semaphore):
