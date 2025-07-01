@@ -622,10 +622,40 @@ async def has_next_page(page):
         # Check if button is visible and not disabled
         is_visible = await next_button.is_visible()
         class_attr = await next_button.get_attribute('class') or ""
-        is_disabled = "disabled" in class_attr
+        parent_class = ""
+        
+        # Also check parent element for disabled class
+        try:
+          parent = await next_button.evaluate('(node) => node.parentElement')
+          if parent:
+            parent_class = await page.evaluate('(node) => node.getAttribute("class") || ""', parent)
+        except:
+          pass
+          
+        # Check both element and parent for disabled status
+        is_disabled = ("disabled" in class_attr) or ("disabled" in parent_class)
+        
+        # Also check aria-disabled attribute
+        aria_disabled = await next_button.get_attribute('aria-disabled')
+        if aria_disabled and aria_disabled.lower() == "true":
+          is_disabled = True
+        
+        # For Clutch.co specifically, check the clickability of the button
+        try:
+          is_clickable = await page.evaluate("""(button) => {
+            const style = window.getComputedStyle(button);
+            const isVisible = style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+            return isVisible && !button.disabled;
+          }""", next_button)
+          
+          if not is_clickable:
+            is_disabled = True
+        except:
+          pass
         
         if is_visible and not is_disabled:
           logging.info(f"✅ Found next page button with selector: {selector}")
+          # Return both the button and whether it's on the last page
           return next_button
     
     # If no selector worked, try a more generic approach for Clutch.co
@@ -645,12 +675,49 @@ async def has_next_page(page):
         # Check if there are more pages after the active one
         if active_index >= 0 and active_index < len(pagination_items) - 1:
           next_item = pagination_items[active_index + 1]
+          # Skip if this is just a "next" button that might be disabled
+          next_item_text = await next_item.text_content()
+          if next_item_text and ("next" in next_item_text.lower() or "»" in next_item_text):
+            # Check if it's disabled
+            next_class = await next_item.get_attribute('class') or ""
+            if "disabled" in next_class:
+              logging.info("❌ Next pagination item is disabled")
+              return None
+              
           next_link = await next_item.query_selector('a')
           if next_link:
-            logging.info("✅ Found next page button using pagination analysis")
-            return next_link
+            # Check if the link is disabled
+            is_disabled = False
+            try:
+              parent_class = await next_item.get_attribute('class') or ""
+              if "disabled" in parent_class:
+                is_disabled = True
+            except:
+              pass
+              
+            if not is_disabled:
+              logging.info("✅ Found next page button using pagination analysis")
+              return next_link
     except Exception as e:
       logging.error(f"Error during pagination analysis: {e}")
+    
+    # Additional check: look for disabled next buttons
+    try:
+      # Check for visible but disabled next buttons
+      disabled_selectors = [
+        '.pagination .page-item.next.disabled',
+        '.pagination .page-item.disabled:has(a:has-text("Next"))',
+        'a.page-link[rel="next"][aria-disabled="true"]',
+        '.pagination .page-item.disabled a[aria-label="Next"]'
+      ]
+      
+      for selector in disabled_selectors:
+        disabled_next = await page.query_selector(selector)
+        if disabled_next and await disabled_next.is_visible():
+          logging.info(f"🛑 Found disabled next button with selector: {selector} - Reached last page")
+          return None
+    except Exception as e:
+      logging.warning(f"Error checking for disabled next buttons: {e}")
       
     # If we get here, no next button was found
     logging.info("❌ No next page button found")
@@ -723,6 +790,7 @@ async def extract_current_page_number(page):
 
 async def navigate_to_next_page(page):
   """Enhanced navigation to the next page specifically optimized for Clutch.co"""
+  from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
   try:
     # Find next button using our improved detector
     next_button = await has_next_page(page)
@@ -742,10 +810,17 @@ async def navigate_to_next_page(page):
           if href.startswith('http'):
             next_url = href
           else:
-            # Construct full URL from relative path
+            # Construct full URL from relative path, preserving query params
             parsed_url = urlparse(current_url)
             base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-            next_url = urljoin(base_url, href)
+            # If href has its own query, use it, else preserve original query
+            if '?' in href:
+              next_url = urljoin(base_url, href)
+            else:
+              # preserve all query params
+              next_url = urljoin(base_url, href)
+              if parsed_url.query:
+                next_url += ('&' if '?' in next_url else '?') + parsed_url.query
       except Exception as e:
         logging.warning(f"Error getting href from next button: {e}")
       
@@ -760,7 +835,18 @@ async def navigate_to_next_page(page):
           await page.goto(next_url, wait_until="domcontentloaded")
           # Wait for the page to load
           await page.wait_for_timeout(3000)
-          return True
+          
+          # Verify we actually navigated to a valid page
+          if await is_valid_results_page(page):
+            new_page_num = await extract_current_page_number(page)
+            if new_page_num > current_page_num:
+              logging.info(f"✅ Successfully navigated to page {new_page_num} via direct URL")
+              return True
+            else:
+              logging.warning(f"⚠️ Navigation may have failed: Expected page > {current_page_num}, got {new_page_num}")
+              # We'll still continue and try clicking
+          else:
+            logging.warning("⚠️ Direct navigation led to invalid page, trying alternate methods")
         except Exception as e:
           logging.warning(f"⚠️ Direct navigation failed: {e}")
           # Fallback to clicking the button
@@ -779,21 +865,15 @@ async def navigate_to_next_page(page):
             await page.evaluate("(button) => button.click()", next_button)
           else:
             # Last resort: construct and navigate to next page URL manually
-            logging.info("🔄 Constructing next page URL manually")
-            next_page_num = current_page_num + 1
-            
-            # For Clutch.co, the URL format is typically /path/to/page?page=X
-            if '?' in current_url:
-              if 'page=' in current_url:
-                next_url = re.sub(r'page=\d+', f'page={next_page_num}', current_url)
-              else:
-                next_url = f"{current_url}&page={next_page_num}"
-            else:
-              next_url = f"{current_url}?page={next_page_num}"
-            
+            logging.info("🔄 Constructing next page URL manually (preserving query params)")
+            parsed_url = urlparse(current_url)
+            query = parse_qs(parsed_url.query)
+            current_page_num = int(query.get('page', [1])[0]) if 'page' in query else 1
+            query['page'] = [str(current_page_num + 1)]
+            next_query = urlencode(query, doseq=True)
+            next_url = urlunparse((parsed_url.scheme, parsed_url.netloc, parsed_url.path, '', next_query, ''))
             logging.info(f"🔄 Attempting navigation to constructed URL: {next_url}")
             await page.goto(next_url, wait_until="domcontentloaded")
-            
           break
         except Exception as click_error:
           if attempt < max_click_attempts - 1:
@@ -801,7 +881,6 @@ async def navigate_to_next_page(page):
             await page.wait_for_timeout(1000)
           else:
             raise
-      
       # Wait for navigation to complete with progressive waits
       try:
         await page.wait_for_load_state("domcontentloaded", timeout=10000)
@@ -820,9 +899,28 @@ async def navigate_to_next_page(page):
       new_url = page.url
       new_page_num = await extract_current_page_number(page)
       
+      # Verify we're on a valid results page
+      is_valid_page = await is_valid_results_page(page)
+      if not is_valid_page:
+        logging.warning("⚠️ Navigation led to an invalid page (possibly a 'No Results' or error page)")
+        return False
+      
       if new_url == current_url and new_page_num == current_page_num:
         logging.warning("⚠️ URL and page number did not change after navigation attempt")
         
+        # Allow continuation for Clutch.co when URL contains our domain
+        if "clutch.co" in current_url:
+          logging.info("🔄 This is a Clutch.co page - checking for valid content despite similar URLs")
+          
+          # Check if the page has business links regardless of URL similarity
+          try:
+            sample_links = await page.query_selector_all('a[href*="r.clutch.co/redirect"]')
+            if sample_links and len(sample_links) > 0:
+              logging.info(f"✅ Found {len(sample_links)} business links on page despite URL similarity - continuing")
+              return True
+          except Exception as e:
+            logging.warning(f"⚠️ Error checking page content after navigation: {e}")
+            
         # Try JavaScript navigation as fallback specifically for Clutch.co
         if current_page_num:
           next_page_num = current_page_num + 1
@@ -845,7 +943,7 @@ async def navigate_to_next_page(page):
           final_url = page.url
           if final_url != current_url:
             logging.info(f"✅ Successfully navigated to: {final_url}")
-            return True
+            return await is_valid_results_page(page)
           else:
             logging.error("❌ All navigation attempts failed")
             return False
@@ -861,7 +959,7 @@ async def navigate_to_next_page(page):
         return True
       except:
         logging.warning("⚠️ Navigation succeeded but page content may be different than expected")
-        return True
+        return await is_valid_results_page(page)
     
     return False
   except Exception as e:
@@ -877,6 +975,10 @@ async def scrape_all_pages(page, start_url, writer, csvfile, unique_businesses):
   max_pages = 100  # Increased for Clutch.co which can have many pages
   consecutive_empty_pages = 0
   max_empty_pages = 3  # Stop if we find 3 empty pages in a row
+  consecutive_navigation_failures = 0
+  max_navigation_failures = 2  # Stop if we can't navigate properly multiple times
+  consecutive_duplicate_pages = 0
+  max_duplicate_pages = 2  # Stop if we find mostly duplicates on consecutive pages
   
   # Navigate to start URL
   try:
@@ -910,6 +1012,7 @@ async def scrape_all_pages(page, start_url, writer, csvfile, unique_businesses):
     logging.info("⚠️ Cloudflare challenge detected, skipping this URL")
     return total_entries, total_businesses_found
   
+
   # Enhanced human simulation
   await simulate_human_behavior(page)
   
@@ -925,6 +1028,21 @@ async def scrape_all_pages(page, start_url, writer, csvfile, unique_businesses):
       logging.info(f"📸 Saved screenshot to {screenshot_path}")
     except:
       pass
+    
+    # Verify this is a valid results page before proceeding
+    if not await is_valid_results_page(page):
+      logging.warning(f"⚠️ Page {page_num} appears to be invalid (no results or error page)")
+      consecutive_navigation_failures += 1
+      if consecutive_navigation_failures >= max_navigation_failures:
+        logging.info(f"🛑 {max_navigation_failures} consecutive navigation failures, stopping pagination")
+        break
+      else:
+        # Try to navigate to the next page anyway
+        page_num += 1
+        continue
+    else:
+      # Reset counter if we found a valid page
+      consecutive_navigation_failures = 0
     
     # For Clutch.co, ensure we capture all lazy-loaded content
     for _ in range(3):  # Multiple scrolls to ensure all content loads
@@ -984,7 +1102,21 @@ async def scrape_all_pages(page, start_url, writer, csvfile, unique_businesses):
       consecutive_empty_pages = 0
     
     # Process the business links
+    original_unique_count = len(unique_businesses)
     entries = await process_business_links(page, business_links, writer, csvfile, unique_businesses)
+    new_unique_count = len(unique_businesses)
+    new_businesses_found = new_unique_count - original_unique_count
+    
+    # Check if this page has mostly duplicate businesses
+    if page_num > 1 and new_businesses_found < 3 and len(business_links) > 5:
+      consecutive_duplicate_pages += 1
+      logging.warning(f"⚠️ Page {page_num}: Only found {new_businesses_found} new businesses out of {len(business_links)} links")
+      if consecutive_duplicate_pages >= max_duplicate_pages:
+        logging.info(f"🛑 {max_duplicate_pages} consecutive pages with few new businesses, stopping pagination")
+        break
+    else:
+      consecutive_duplicate_pages = 0  # Reset if we found new businesses
+    
     total_entries += entries
     total_businesses_found += len(business_links)
     
@@ -994,29 +1126,43 @@ async def scrape_all_pages(page, start_url, writer, csvfile, unique_businesses):
     next_button = await has_next_page(page)
     if not next_button:
       logging.info(f"🏁 Reached the last page ({page_num}) for {start_url}")
+      
+      # Take a screenshot of the last page for verification
+      try:
+        last_page_screenshot = f"logs/last_page_{page_num}_{datetime.now().strftime('%H%M%S')}.png"
+        await page.screenshot(path=last_page_screenshot)
+        logging.info(f"📸 Saved last page screenshot to {last_page_screenshot}")
+      except:
+        pass
+        
       break
     
     # Navigate to the next page with our improved function
-    if not await navigate_to_next_page(page):
+    navigation_success = await navigate_to_next_page(page)
+    if not navigation_success:
       logging.warning(f"⚠️ Failed to navigate to next page after page {page_num}")
+      consecutive_navigation_failures += 1
       
+      if consecutive_navigation_failures >= max_navigation_failures:
+        logging.info(f"🛑 {max_navigation_failures} consecutive navigation failures, stopping pagination")
+        break
+        
       # For Clutch.co, try a direct URL approach as last resort
       current_page_num = await extract_current_page_number(page)
       next_page_num = current_page_num + 1
       
-      # Try to construct next page URL in Clutch.co format
+      # Try to construct next page URL in Clutch.co format, preserving query params
       try:
-        # Get base URL without query parameters
-        base_url = current_url.split('?')[0]
-        
-        # Construct next page URL
-        next_url = f"{base_url}?page={next_page_num}"
-        
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+        parsed_url = urlparse(current_url)
+        query = parse_qs(parsed_url.query)
+        query['page'] = [str(next_page_num)]
+        next_query = urlencode(query, doseq=True)
+        next_url = urlunparse((parsed_url.scheme, parsed_url.netloc, parsed_url.path, '', next_query, ''))
         logging.info(f"🔄 Attempting direct navigation to Clutch.co format URL: {next_url}")
         await page.goto(next_url, wait_until="domcontentloaded")
         await page.wait_for_timeout(5000)
         await simulate_human_behavior(page)
-        
         # Verify navigation worked
         new_page_num = await extract_current_page_number(page)
         if new_page_num != next_page_num:
@@ -1025,6 +1171,9 @@ async def scrape_all_pages(page, start_url, writer, csvfile, unique_businesses):
       except Exception as e:
         logging.error(f"❌ Manual navigation also failed: {e}")
         break
+    else:
+      # Reset the counter if navigation was successful
+      consecutive_navigation_failures = 0
     
     page_num += 1
     
@@ -1117,6 +1266,7 @@ async def process_business_links(page, links, writer, csvfile, unique_businesses
   hrefs = []
   processed_urls = set()
   skipped_profile_count = 0
+  duplicate_business_count = 0
   
   for link in links:
     href = await link.get_attribute('href')
@@ -1125,12 +1275,25 @@ async def process_business_links(page, links, writer, csvfile, unique_businesses
       if "clutch.co/profile" in href:
         skipped_profile_count += 1
         continue  # Skip this link
+        
+      # Check if we've already processed this business by extracting name early
+      try:
+        business_name = extract_business_name_from_url(clean_url(href))
+        if business_name and business_name in unique_businesses:
+          duplicate_business_count += 1
+          continue  # Skip already processed business
+      except Exception:
+        # If we can't extract the business name, continue with processing
+        pass
+        
       processed_urls.add(href)
       hrefs.append((link, href))
   
   total_links = len(hrefs)
   if skipped_profile_count > 0:
     logging.info(f"🔍 Skipped {skipped_profile_count} profile links")
+  if duplicate_business_count > 0:
+    logging.info(f"🔄 Skipped {duplicate_business_count} duplicate businesses already processed")
   logging.info(f"🚀 Processing {total_links} direct website links in parallel...")
 
   # Create a semaphore to limit concurrent executions
@@ -1186,6 +1349,93 @@ async def read_base_urls():
     return []
 
 
+async def is_valid_results_page(page):
+  """Check if the current page contains valid search results or is an error/empty page"""
+  try:
+    # First, check for common error messages or "No Results Found" indicators
+    error_selectors = [
+      '.no-results-found', 
+      '.error-page', 
+      '.empty-results',
+      'text="No results found"',
+      'text="No matching results"',
+      'text="Sorry, no companies match your filters"',
+      '.search-no-results'
+    ]
+    
+    for selector in error_selectors:
+      try:
+        error_element = await page.query_selector(selector)
+        if error_element and await error_element.is_visible():
+          logging.warning(f"⚠️ Found error/no results indicator: {selector}")
+          return False
+      except:
+        pass
+    
+    # For Clutch.co, simply having business links is enough to consider the page valid
+    # even if they're the same as a previous page
+    try:
+      clutch_links = await page.query_selector_all('a[href*="r.clutch.co/redirect"]')
+      if clutch_links and len(clutch_links) > 0:
+        logging.info(f"✅ Found {len(clutch_links)} Clutch.co redirect links - considering page valid")
+        return True
+    except:
+      pass
+    
+    # Check for presence of business listings or pagination
+    valid_content_selectors = [
+      '.provider-info', 
+      '.providers-directory', 
+      '.listing-companies',
+      '.pagination',
+      '.listing-item',
+      '.provider-row'
+    ]
+    
+    for selector in valid_content_selectors:
+      try:
+        content_elements = await page.query_selector_all(selector)
+        if content_elements and len(content_elements) > 0:
+          # Check if at least one element is visible
+          for element in content_elements:
+            if await element.is_visible():
+              return True
+      except:
+        pass
+    
+    # If we get here and haven't found valid content, do one more check:
+    # Try to find any external links that might be business websites
+    try:
+      external_links = await page.evaluate('''() => {
+        const links = Array.from(document.querySelectorAll('a[href^="http"]'));
+        const externalLinks = links.filter(a => 
+          !a.href.includes(window.location.hostname) && 
+          !a.href.includes('facebook.com') && 
+          !a.href.includes('twitter.com') && 
+          !a.href.includes('linkedin.com') &&
+          !a.href.includes('google.com') &&
+          !a.href.includes('clutch.co/directories') &&
+          !a.href.includes('clutch.co/about-us') &&
+          !a.href.includes('clutch.co/methodology')
+        );
+        return externalLinks.length;
+      }''')
+      
+      if external_links > 5:  # If we found a good number of external links, it's probably a valid page
+        return True
+    except:
+      pass
+    
+    # If we've exhausted all checks and found nothing, it's probably not a valid results page
+    logging.warning("⚠️ Page doesn't appear to contain valid search results")
+    return False
+    
+  except Exception as e:
+    logging.error(f"Error checking if page is valid: {e}")
+    # Default to True in case of error, to avoid breaking the scraping process
+    return True
+
+
 async def main():
   """Main function"""
   log_filename = setup_logging()
@@ -1233,6 +1483,7 @@ async def main():
       unique_businesses = set()
       total_entries = 0
       total_businesses_found = 0
+      csvfile = None
       
       with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
         fieldnames = ['website_url', 'business_name', 'email', 'phone']
