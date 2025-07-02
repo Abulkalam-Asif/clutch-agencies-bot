@@ -5,10 +5,13 @@ import os
 import json
 import logging
 import random
+import sys
+import time
 from datetime import datetime
 from urllib.parse import urljoin, urlparse, urlunparse
 from playwright.async_api import async_playwright
 
+max_concurrent = 50
 
 def setup_logging():
   """Setup logging configuration with timestamped log file"""
@@ -387,31 +390,14 @@ async def get_business_links_from_page(page):
     '.listing-item a.website'
   ]
   
-  # Try multiple selectors, but don't fail if timeout
+  # OPTIMIZED: Skip initial complex scrolling - go straight to selector finding
+  # Most links are visible immediately on modern Clutch.co pages
   found_selector = None
   
-  # First, ensure all content is loaded by scrolling
-  try:
-    # For Clutch.co, we need multiple scrolls to ensure all content is loaded
-    total_height = await page.evaluate('document.body.scrollHeight')
-    viewport_height = await page.evaluate('window.innerHeight')
-    scroll_steps = max(3, int(total_height / viewport_height))
-    
-    for i in range(scroll_steps):
-      scroll_position = int(i * viewport_height * 0.8)  # 80% of viewport for each step
-      await page.evaluate(f'window.scrollTo(0, {scroll_position})')
-      await page.wait_for_timeout(1000)  # Wait for content to load
-    
-    # Final scroll to bottom
-    await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-    await page.wait_for_timeout(2000)  # Wait for any final content to load
-  except Exception as e:
-    logging.warning(f"⚠️ Error during initial scroll: {e}")
-  
-  # Now try the various selectors to find business links
+  # Try the various selectors to find business links immediately
   for selector in link_selectors:
     try:
-      await page.wait_for_selector(selector, timeout=5000)
+      await page.wait_for_selector(selector, timeout=3000)  # Reduced timeout
       found_selector = selector
       logging.info(f"✅ Found business links using selector: {selector}")
       break
@@ -457,15 +443,13 @@ async def get_business_links_from_page(page):
       except Exception as e:
         logging.error(f"❌ Error when checking for generic links: {e}")
   
-  # Give the page a moment to load
-  await page.wait_for_timeout(3000)
+  # Give the page a minimal moment to load
+  await page.wait_for_timeout(500)  # Reduced from 3000 for speed
   
-  # Enhanced scroll to load all businesses on current page
-  prev_count = 0
+  # OPTIMIZED: Fast scrolling with batch collection
+  # Scroll to load all content in fewer attempts with larger increments
   scroll_attempts = 0
-  max_attempts = 10  # Increased for Clutch.co
-  scroll_increment = 500  # Smaller increments for more granular loading
-  current_count = 0
+  max_attempts = 3  # Reduced from 10 for speed
   
   # Function to count links with valid selector
   async def count_links():
@@ -477,73 +461,53 @@ async def get_business_links_from_page(page):
         pass
     return 0
   
-  # Initial wait and count
-  await page.wait_for_timeout(2000)
+  # Initial count
   current_count = await count_links()
   
   # If no links found initially, try scrolling anyway to trigger lazy loading
   if current_count == 0:
-    logging.info("⚠️ No links found initially, scrolling to trigger lazy loading...")
+    logging.info("⚠️ No links found initially, fast scrolling to trigger lazy loading...")
   
-  # Progressive scrolling to load all content
-  total_scroll_height = 0
-  all_links = []
-  
-  # For Clutch.co, we need to be very thorough with scrolling
-  while scroll_attempts < max_attempts:
-    try:
-      prev_count = current_count
+  # OPTIMIZED: Fast bulk scrolling without counting between scrolls
+  try:
+    # Get page dimensions for optimized scrolling
+    page_height = await page.evaluate('document.body.scrollHeight')
+    viewport_height = await page.evaluate('window.innerHeight')
+    
+    # Calculate how many large scrolls we need (fewer, larger scrolls)
+    scroll_distance = viewport_height * 2  # Scroll 2 viewports at a time
+    scroll_positions = []
+    
+    # Generate scroll positions to cover the entire page
+    current_pos = 0
+    while current_pos < page_height:
+      scroll_positions.append(current_pos)
+      current_pos += scroll_distance
+    
+    # Add final scroll to absolute bottom
+    scroll_positions.append(page_height)
+    
+    logging.info(f"� Fast scrolling through {len(scroll_positions)} positions to load all content")
+    
+    # Execute all scrolls quickly without individual checks
+    for i, pos in enumerate(scroll_positions):
+      await page.evaluate(f"window.scrollTo(0, {pos})")
+      # Minimal delay between scrolls for content loading
+      await page.wait_for_timeout(200)  # Much faster than previous 1500-2500ms
       
-      # Scroll down in increments
-      total_scroll_height += scroll_increment
-      await page.evaluate(f"window.scrollTo(0, {total_scroll_height})")
-      await page.wait_for_timeout(random.randint(1500, 2500))
-      
-      # Check if we've reached bottom of page
-      is_at_bottom = await page.evaluate('''() => {
-        return window.innerHeight + window.scrollY >= document.body.scrollHeight - 200;
-      }''')
-      
-      # Count links after scrolling
-      current_count = await count_links()
-      
-      # Log progress
-      if current_count > prev_count:
-        logging.info(f"📈 Found {current_count - prev_count} new businesses, total: {current_count}")
-        scroll_attempts = 0  # Reset counter if we found new links
-      else:
-        scroll_attempts += 1
-        logging.info(f"🔄 Scrolling to load more businesses ({scroll_attempts}/{max_attempts}), found {current_count} so far")
-      
-      # If we've reached the bottom and count didn't change, we're probably done
-      if is_at_bottom and current_count == prev_count:
-        # One final scroll to bottom to be sure
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(2000)
-        
-        # Try clicking "Show More" buttons that might be present on Clutch.co
-        try:
-          show_more_buttons = await page.query_selector_all('button:has-text("Show More"), a:has-text("Show More"), .show-more, .load-more')
-          if show_more_buttons and len(show_more_buttons) > 0:
-            for button in show_more_buttons:
-              if await button.is_visible():
-                logging.info("🖱️ Clicking 'Show More' button")
-                await button.click()
-                await page.wait_for_timeout(3000)
-        except Exception as e:
-          logging.warning(f"⚠️ Error clicking 'Show More' button: {e}")
-        
-        final_count = await count_links()
-        
-        if final_count == current_count:
-          logging.info(f"🛑 Reached bottom of page with {current_count} businesses, stopping scroll")
-          break
-        else:
-          current_count = final_count
-          
-    except Exception as e:
-      logging.warning(f"⚠️ Error while scrolling: {e}")
-      break
+      # Only log progress every few scrolls
+      if i % 3 == 0 or i == len(scroll_positions) - 1:
+        logging.info(f"� Fast scroll progress: {i+1}/{len(scroll_positions)}")
+    
+    # Final count after all scrolling is complete
+    final_count = await count_links()
+    logging.info(f"✅ Fast scrolling complete: Found {final_count} business links")
+    
+  except Exception as e:
+    logging.warning(f"⚠️ Error during fast scrolling: {e}")
+    # Fallback to simple scroll to bottom
+    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    await page.wait_for_timeout(1000)
   
   # Final collection of all links
   if found_selector:
@@ -798,7 +762,7 @@ async def extract_current_page_number(page):
     if pagination_items:
       for i, item in enumerate(pagination_items):
         class_attr = await item.get_attribute('class') or ""
-        if "active" in class_attr:
+        if "active" in class_attr or "pager-current" in class_attr:
           # The active item index might correspond to page number
           # But need to account for potential "previous" button at the beginning
           text = await item.text_content()
@@ -1081,14 +1045,6 @@ async def scrape_all_pages(page, start_url, writer, csvfile, unique_businesses):
     current_url = page.url
     logging.info(f"📄 Processing page {page_num} of {start_url} (Current URL: {current_url})")
     
-    # Take screenshot for debugging pagination issues
-    screenshot_path = f"logs/page_{page_num}_{datetime.now().strftime('%H%M%S')}.png"
-    try:
-      await page.screenshot(path=screenshot_path)
-      logging.info(f"📸 Saved screenshot to {screenshot_path}")
-    except:
-      pass
-    
     # Verify this is a valid results page before proceeding
     if not await is_valid_results_page(page):
       logging.warning(f"⚠️ Page {page_num} appears to be invalid (no results or error page)")
@@ -1167,25 +1123,19 @@ async def scrape_all_pages(page, start_url, writer, csvfile, unique_businesses):
     new_unique_count = len(unique_businesses)
     new_businesses_found = new_unique_count - original_unique_count
     
-    # Track duplicate statistics but don't stop pagination based on duplicates
-    if page_num > 1 and len(business_links) > 0:
-      # Calculate percentage of duplicates for informational purposes
-      duplicate_percentage = 100 - ((new_businesses_found / len(business_links)) * 100)
-      
-      if new_businesses_found < 3 and len(business_links) > 5:
-        consecutive_duplicate_pages += 1
-        logging.warning(f"⚠️ Page {page_num}: Found {new_businesses_found} new businesses out of {len(business_links)} links ({duplicate_percentage:.1f}% duplicates)")
-        logging.info(f"� Consecutive pages with high duplicates: {consecutive_duplicate_pages} - continuing pagination")
-      else:
-        # Reset counter if we found enough new businesses (more than 3 or 20% of the links)
-        if new_businesses_found > 3 or (len(business_links) > 0 and (new_businesses_found / len(business_links) >= 0.2)):
-          consecutive_duplicate_pages = 0  # Reset counter
-          logging.info(f"✅ Found {new_businesses_found} new businesses ({(new_businesses_found / len(business_links) * 100):.1f}% of total) - resetting duplicate counter")
+    # OPTIMIZED: Simplified duplicate tracking - no longer stop or warn based on duplicates
+    # Featured businesses will naturally appear as duplicates, this is expected behavior
+    if new_businesses_found > 0:
+      logging.info(f"📊 Page {page_num}: Added {new_businesses_found} NEW businesses (processed {len(business_links)} total links)")
+      consecutive_duplicate_pages = 0  # Reset any duplicate counter
+    else:
+      logging.info(f"📊 Page {page_num}: No new businesses added (all {len(business_links)} were duplicates/featured - this is normal)")
+      # Don't increment consecutive_duplicate_pages - just continue processing
     
     total_entries += entries
     total_businesses_found += len(business_links)
     
-    logging.info(f"✅ Page {page_num}: Found and processed {len(business_links)} businesses")
+    logging.info(f"✅ Page {page_num}: Completed processing {len(business_links)} businesses")
     
     # Check if there's a next page with our improved function
     next_button = await has_next_page(page)
@@ -1413,43 +1363,33 @@ async def process_business_links(page, links, writer, csvfile, unique_businesses
   if not links:
     return 0
     
-  # Get hrefs first to filter duplicates and profile links before processing
+  # OPTIMIZED: Don't pre-filter duplicates - process all and handle duplicates in CSV writing
+  # This prevents skipping entire pages due to featured businesses
   hrefs = []
   processed_urls = set()
   skipped_profile_count = 0
-  duplicate_business_count = 0
   
   for link in links:
     href = await link.get_attribute('href')
-    # Skip profile links and only process direct website links
+    # Only skip profile links and already processed URLs in this batch
     if href and href not in processed_urls:
       if "clutch.co/profile" in href:
         skipped_profile_count += 1
         continue  # Skip this link
         
-      # Check if we've already processed this business by extracting name early
-      try:
-        business_name = extract_business_name_from_url(clean_url(href))
-        if business_name and business_name in unique_businesses:
-          duplicate_business_count += 1
-          continue  # Skip already processed business
-      except Exception:
-        # If we can't extract the business name, continue with processing
-        pass
-        
+      # DON'T skip duplicates here - let them be processed and handled in CSV writing
+      # This ensures we don't skip entire pages due to featured businesses
       processed_urls.add(href)
       hrefs.append((link, href))
   
   total_links = len(hrefs)
   if skipped_profile_count > 0:
     logging.info(f"🔍 Skipped {skipped_profile_count} profile links")
-  if duplicate_business_count > 0:
-    logging.info(f"🔄 Skipped {duplicate_business_count} duplicate businesses already processed")
-  logging.info(f"🚀 Processing {total_links} direct website links in parallel...")
+  
+  # Note: We now process ALL business links, duplicates will be handled during CSV writing
+  logging.info(f"🚀 Processing {total_links} business links in parallel (duplicates handled during save)...")
 
   # Create a semaphore to limit concurrent executions
-  # Adjust the value based on your system capabilities and website limitations
-  max_concurrent = 7  # Process 7 businesses concurrently
   semaphore = asyncio.Semaphore(max_concurrent)
   
   # Create tasks for each business link
@@ -1465,14 +1405,19 @@ async def process_business_links(page, links, writer, csvfile, unique_businesses
     tasks.append(task)
     
     # Log progress periodically
-    if (i + 1) % 5 == 0 or i == total_links - 1:
+    if (i + 1) % 10 == 0 or i == total_links - 1:
       logging.info(f"⏳ Created tasks for {i + 1}/{total_links} businesses")
   
   # Wait for all tasks to complete and collect results
   results = await asyncio.gather(*tasks)
   total_entries = sum(results)
   
-  logging.info(f"✅ Completed processing {total_links} businesses with {total_entries} entries added")
+  duplicate_count = total_links - total_entries
+  if duplicate_count > 0:
+    logging.info(f"📊 Processed {total_links} links: {total_entries} new entries, {duplicate_count} duplicates filtered")
+  else:
+    logging.info(f"✅ Completed processing {total_links} businesses with {total_entries} entries added")
+  
   return total_entries
 
 
@@ -1578,6 +1523,45 @@ async def is_valid_results_page(page):
     return True
 
 
+def cleanup_csv_duplicates(csv_filename):
+  """Remove duplicate entries from CSV file based on business_name"""
+  try:
+    # Read the CSV file
+    with open(csv_filename, 'r', newline='', encoding='utf-8') as file:
+      reader = csv.DictReader(file)
+      rows = list(reader)
+    
+    # Remove duplicates based on business_name (case-insensitive)
+    seen_businesses = set()
+    unique_rows = []
+    duplicates_removed = 0
+    
+    for row in rows:
+      business_name_lower = row['business_name'].lower().strip()
+      if business_name_lower not in seen_businesses:
+        seen_businesses.add(business_name_lower)
+        unique_rows.append(row)
+      else:
+        duplicates_removed += 1
+    
+    # Write the cleaned data back to the file
+    with open(csv_filename, 'w', newline='', encoding='utf-8') as file:
+      if unique_rows:
+        fieldnames = unique_rows[0].keys()
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(unique_rows)
+    
+    logging.info(f"🧹 CSV cleanup: Removed {duplicates_removed} duplicate entries")
+    logging.info(f"📄 Final CSV contains {len(unique_rows)} unique businesses")
+    
+    return len(unique_rows), duplicates_removed
+    
+  except Exception as e:
+    logging.error(f"❌ Error cleaning CSV file: {e}")
+    return 0, 0
+
+
 async def main():
   """Main function"""
   log_filename = setup_logging()
@@ -1650,6 +1634,14 @@ async def main():
             logging.error(f"Error processing URL {start_url}: {e}")
 
       logging.info(f"🎉 Scraping completed! Total entries: {total_entries}")
+
+      # Cleanup duplicates from the final CSV
+      try:
+        logging.info("🧹 Cleaning up duplicates in the final CSV file...")
+        total_unique, total_duplicates = cleanup_csv_duplicates(csv_filename)
+        logging.info(f"📊 CSV Cleanup completed: {total_unique} unique entries, {total_duplicates} duplicates removed")
+      except Exception as e:
+        logging.error(f"Error during CSV cleanup: {e}")
 
     except Exception as e:
       logging.error(f"Error in main processing: {e}")
